@@ -1255,10 +1255,12 @@
 
             userWithdrawalRequestsRef = database.ref('withdrawalRequests/' + userId);
             
+            // Listen for changes to children (individual withdrawal requests)
             userWithdrawalRequestsRef.on('child_changed', async (snapshot) => {
                 const requestId = snapshot.key;
                 const requestData = snapshot.val();
 
+                // Only process if status is 'rejected' and reversal hasn't been processed yet
                 if (requestData && requestData.status === 'rejected' && !requestData.reversalProcessed) {
                     console.log(`Withdrawal ${requestId} rejected. Processing refund for ${requestData.amount} coins.`);
                     try {
@@ -1273,14 +1275,17 @@
 
                         if (transactionResult.committed) {
                             const newBalanceAfterRefund = transactionResult.snapshot.val().balance;
+                            // Mark reversal as processed to prevent double refunds
                             const reversalUpdates = {};
                             reversalUpdates[`withdrawalRequests/${userId}/${requestId}/reversalProcessed`] = true;
-                            reversalUpdates[`withdrawalRequests/${userId}/${requestId}/statusMessage`] = "Refunded after rejection.";
-                            reversalUpdates[`allWithdrawalRequests/${requestId}/reversalProcessed`] = true; // Keep admin view consistent
-                            reversalUpdates[`allWithdrawalRequests/${requestId}/statusMessage`] = "Refunded after rejection."; // Keep admin view consistent
+                            reversalUpdates[`withdrawalRequests/${userId}/${requestId}/statusMessage`] = (requestData.statusMessage || "") + " Coins refunded.";
+                            // Also update the admin-facing request if it exists
+                            reversalUpdates[`allWithdrawalRequests/${requestId}/reversalProcessed`] = true; 
+                            reversalUpdates[`allWithdrawalRequests/${requestId}/statusMessage`] = (requestData.statusMessage || "") + " Coins refunded.";
                             
                             await database.ref().update(reversalUpdates);
                             console.log(`Refund of ${requestData.amount} processed for withdrawal ${requestId}. New balance: ${newBalanceAfterRefund}`);
+                            // UI will update via the main user data listener
                         } else {
                              console.error(`Refund transaction for withdrawal ${requestId} was aborted.`);
                         }
@@ -1288,6 +1293,8 @@
                         console.error(`Error processing refund for withdrawal ${requestId}:`, error);
                     }
                 }
+                // IMPORTANT: No action is taken here if status is 'approved'.
+                // Coins are deducted at submission and remain deducted if approved.
             });
             userWithdrawalRequestsListenerAttached = true;
             console.log("Attached listener for withdrawal status changes for user:", userId);
@@ -1308,7 +1315,7 @@
             if (user) {
                 console.log("User is currently logged in:", user.uid);
                 await loadAndSetUserData(user.uid, user.email);
-                listenForWithdrawalStatusChanges(user.uid); // ATTACH LISTENER
+                listenForWithdrawalStatusChanges(user.uid); // ATTACH LISTENER for withdrawal status
                 
                 const currentActive = document.querySelector('.screen.active');
                 if (!currentActive || currentActive.id === 'signUpScreen' || currentActive.id === 'loginScreen') {
@@ -1321,9 +1328,10 @@
             } else {
                 console.log("No user logged in.");
                 detachChatListener(); 
-                detachUserWithdrawalRequestsListener(); // DETACH LISTENER
+                detachUserWithdrawalRequestsListener(); // DETACH LISTENER for withdrawal status
                 if (currentUserData && currentUserData.uid) { 
-                    database.ref('users/' + currentUserData.uid).off();
+                    // Detach the main user data listener
+                    database.ref('users/' + currentUserData.uid).off('value');
                 }
                 currentUserData = null;
                 clearUserInfoUI();
@@ -1334,28 +1342,31 @@
 
         async function loadAndSetUserData(userId, email) {
             try {
+                // Detach listener from previous user if any
                 if (currentUserData && currentUserData.uid && currentUserData.uid !== userId) {
-                    database.ref('users/' + currentUserData.uid).off();
+                    database.ref('users/' + currentUserData.uid).off('value');
                 }
 
-                const snapshot = await database.ref('users/' + userId).once('value');
+                const userRef = database.ref('users/' + userId);
+                const snapshot = await userRef.once('value');
                 let userData = snapshot.val();
 
                 if (!userData) { 
-                    const name = email.split('@')[0];
+                    const name = email.split('@')[0]; // Default username from email
                     userData = {
                         username: name,
                         email: email,
                         balance: 0, 
                         referralCode: generateReferralCode(userId.substring(0, 6).toUpperCase()),
-                        lastDailyCheckIn: '1970-01-01',
-                        lastFreeSpinDate: '1970-01-01',
-                        availableSpins: 1,
+                        lastDailyCheckIn: '1970-01-01', // For new users
+                        lastFreeSpinDate: '1970-01-01', // For new users
+                        availableSpins: 1, // Initial free spin
                         vipStatus: false, 
                         referralsMade: 0, 
                     };
-                    await database.ref('users/' + userId).set(userData);
+                    await userRef.set(userData); // Set initial data for new user
                 } else {
+                    // Check for new fields and set defaults if missing (for existing users after an app update)
                     const defaultNewFields = {
                         lastDailyCheckIn: userData.lastDailyCheckIn || '1970-01-01',
                         lastFreeSpinDate: userData.lastFreeSpinDate || '1970-01-01',
@@ -1370,37 +1381,46 @@
                             needsUpdate = true;
                         }
                     }
-                    if(needsUpdate) await database.ref('users/' + userId).update(userData);
+                    if(needsUpdate) await userRef.update(userData); // Update if new fields were added
                 }
                 
-                // Remove old listener before attaching new one to prevent multiple listeners on same path
+                // Ensure only one 'value' listener is attached to the current user's path
                 if (currentUserData && currentUserData.uid === userId) {
-                     database.ref('users/' + userId).off('value'); // Detach specific 'value' listener if re-loading same user
+                     userRef.off('value'); // Detach existing listener before attaching a new one for the same user
                 }
 
-                currentUserData = { ...userData, uid: userId };
-                updateUserInfoUI(currentUserData);
+                currentUserData = { ...userData, uid: userId }; // Set local cache
+                updateUserInfoUI(currentUserData); // Update UI immediately
 
-                database.ref('users/' + userId).on('value', (snapshot) => {
+                // Listen for real-time updates to user data
+                userRef.on('value', (snapshot) => {
                     const updatedUserData = snapshot.val();
                     if (updatedUserData) {
-                        currentUserData = { ...updatedUserData, uid: userId };
-                        updateUserInfoUI(currentUserData); 
+                        currentUserData = { ...updatedUserData, uid: userId }; // Update local cache
+                        updateUserInfoUI(currentUserData); // Update UI with new data
+                        
+                        // Update specific screen UIs if they are active
                         if (document.getElementById('spinWinScreen').classList.contains('active')) {
                             updateSpinUI();
                         }
                          if (document.getElementById('walletScreen').classList.contains('active')) {
                             walletBalanceDisplay.textContent = `🪙 ${currentUserData.balance.toLocaleString()}`;
                         }
+                        // If history screens are active, they might need a refresh if balance changes affect them
+                        // However, history is usually loaded once on screen show.
                     }
+                }, (error) => {
+                    console.error("Error listening to user data:", error);
+                    // Handle error, e.g., by showing a message or attempting to re-authenticate
                 });
 
 
             } catch (error) {
                 console.error("Error loading/setting user data:", error);
+                // Potentially sign out user or show error message if data load fails critically
                 currentUserData = null; 
                 clearUserInfoUI();
-                showScreen('signUpScreen');
+                showScreen('signUpScreen'); // Fallback to signup
                 bottomNav.style.display = 'none';
             }
         }
@@ -1413,9 +1433,11 @@
             if (referralCodeDisplay) referralCodeDisplay.textContent = userData.referralCode || "N/A";
             if (walletBalanceDisplay) walletBalanceDisplay.textContent = `🪙 ${userData.balance.toLocaleString()}`;
             
+            // If profile screen is active, ensure its dynamic content is updated
             if (document.getElementById('profileScreen').classList.contains('active')) { 
                 populateProfileScreen(userData);
             }
+            // If spin screen is active, update spin related UI
             if (document.getElementById('spinWinScreen').classList.contains('active')) {
                 updateSpinUI();
             }
@@ -1426,13 +1448,15 @@
             profileUserName.textContent = userData.username;
             profileUserEmail.textContent = userData.email;
             profileEditNameInput.value = userData.username;
-            profileEditEmailInput.value = userData.email;
+            profileEditEmailInput.value = userData.email; // Keep email field pre-filled
             profileVipBadge.style.display = userData.vipStatus ? 'inline-block' : 'none';
+            
+            // Clear password fields for security and usability
             profileCurrentPasswordForEmailInput.value = '';
             profileCurrentPasswordForPasswordInput.value = '';
             profileNewPasswordInput.value = '';
             profileConfirmNewPasswordInput.value = '';
-            profileMessage.style.display = 'none';
+            profileMessage.style.display = 'none'; // Hide any previous messages
         }
 
         function clearUserInfoUI() {
@@ -1443,9 +1467,17 @@
             if (availableSpinsText) availableSpinsText.textContent = "Available Spins: 0";
             if (spinButton) spinButton.disabled = true;
             
+            // Clear profile screen fields
             profileUserName.textContent = "User Name";
             profileUserEmail.textContent = "user@example.com";
             profileVipBadge.style.display = 'none';
+            profileEditNameInput.value = '';
+            profileEditEmailInput.value = '';
+            profileCurrentPasswordForEmailInput.value = '';
+            profileCurrentPasswordForPasswordInput.value = '';
+            profileNewPasswordInput.value = '';
+            profileConfirmNewPasswordInput.value = '';
+            profileMessage.style.display = 'none';
         }
 
 
@@ -1474,9 +1506,11 @@
                     const user = userCredential.user;
                     console.log("User signed up:", user.uid);
 
-                    let initialBalance = 0;
+                    let initialBalance = 0; // Default initial balance
                     let referredByUID = null;
+                    let referralBonusAwarded = false; // Flag to track if referral bonus given
 
+                    // Check if a valid referral code was entered
                     if (enteredReferralCode) {
                         const referrerSnapshot = await database.ref('users')
                                                               .orderByChild('referralCode')
@@ -1485,33 +1519,45 @@
                         
                         if (referrerSnapshot.exists()) {
                             const referrerData = referrerSnapshot.val();
-                            const referrerUID = Object.keys(referrerData)[0]; 
+                            const referrerUID = Object.keys(referrerData)[0]; // Get UID of the referrer
                             const referrer = referrerData[referrerUID];
 
+                            // Ensure user is not referring themselves
                             if (referrerUID !== user.uid) { 
-                                initialBalance = 30; 
+                                initialBalance = 30; // Award bonus to new user
                                 referredByUID = referrerUID;
+                                referralBonusAwarded = true;
+                                
+                                // Update referrer's data (e.g., increment referral count)
                                 const currentReferralsMade = referrer.referralsMade || 0;
                                 await database.ref('users/' + referrerUID).update({
                                     referralsMade: currentReferralsMade + 1
+                                    // Optionally, award bonus to referrer here if that's part of the logic
                                 });
+                                console.log(`User ${user.uid} referred by ${referrerUID}. Awarded ${initialBalance} coins.`);
+                            } else {
+                                console.log("User attempted to use their own referral code or an invalid one related to self.");
                             }
+                        } else {
+                             console.log(`Referral code ${enteredReferralCode} not found.`);
                         }
                     }
 
+                    // Set up the new user's profile in the database
                     const newUserSetup = {
                         username: name,
                         email: email,
                         balance: initialBalance,
                         referralCode: generateReferralCode(user.uid.substring(0, 6).toUpperCase()),
-                        lastDailyCheckIn: '1970-01-01',
-                        lastFreeSpinDate: '1970-01-01',
-                        availableSpins: 1, 
+                        lastDailyCheckIn: '1970-01-01', // Ensures they can check-in first time
+                        lastFreeSpinDate: '1970-01-01', // Ensures they get first free spin
+                        availableSpins: 1, // All new users get one spin
                         vipStatus: false, 
-                        referralsMade: 0, 
-                        ...(referredByUID && { referredBy: referredByUID }) 
+                        referralsMade: 0, // New user has made 0 referrals initially
+                        ...(referredByUID && { referredBy: referredByUID }) // Store who referred them
                     };
                     await database.ref('users/' + user.uid).set(newUserSetup);
+                    // User data will be loaded by onAuthStateChanged -> loadAndSetUserData
                 } catch (error) {
                     showUIMessage(signUpError, error.message, "error");
                     console.error("Sign up error:", error);
@@ -1536,6 +1582,7 @@
                     loginButton.disabled = true;
                     loginButton.textContent = "Logging In...";
                     await auth.signInWithEmailAndPassword(email, password);
+                    // onAuthStateChanged will handle navigation and data loading
                 } catch (error) {
                     showUIMessage(loginError, error.message, "error");
                     console.error("Login error:", error);
@@ -1549,85 +1596,112 @@
         if (logoutButton) {
             logoutButton.addEventListener('click', () => {
                 detachChatListener(); 
-                detachUserWithdrawalRequestsListener(); // DETACH Withdrawal Listener
+                detachUserWithdrawalRequestsListener(); 
                 if (currentUserData && currentUserData.uid) {
-                    database.ref('users/' + currentUserData.uid).off(); 
+                    // Detach the main user data listener for the logged-out user
+                    database.ref('users/' + currentUserData.uid).off('value'); 
                 }
                 auth.signOut().catch((error) => console.error("Logout error:", error));
+                // onAuthStateChanged will handle UI clearing and navigation to signUpScreen
             });
         }
         
         function generateReferralCode(base = '') {
-            const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; 
-            let code = base;
-            const length = 8 - base.length;
-            for (let i = 0; i < length; i++) {
+            const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // Removed I, O, 0, 1 for clarity
+            let code = base; // Start with a base if provided (e.g., part of UID)
+            const requiredLength = 8;
+            const randomCharsNeeded = requiredLength - base.length;
+
+            for (let i = 0; i < randomCharsNeeded; i++) {
                 code += chars.charAt(Math.floor(Math.random() * chars.length));
             }
             return code.toUpperCase();
         }
 
         function showUIMessage(element, message, type = "error") {
+            if (!element) return; // Guard against null element
             element.textContent = message;
-            element.className = `message-text ${type}`; 
+            element.className = `message-text ${type}`; // type can be "error" or "success"
             element.style.display = 'block';
-            setTimeout(() => { element.style.display = 'none'; }, 5000);
+            // Automatically hide message after 5 seconds
+            setTimeout(() => { if (element) element.style.display = 'none'; }, 5000);
         }
 
         if(dailyCheckInButton) {
             dailyCheckInButton.addEventListener('click', async () => {
-                if (!currentUserData) { alert("Please login first."); return; }
-                const today = new Date().toISOString().split('T')[0]; 
+                if (!currentUserData || !currentUserData.uid) { 
+                    alert("Please login first to perform daily check-in."); 
+                    return; 
+                }
+                const today = new Date().toISOString().split('T')[0]; // YYYY-MM-DD format
+                
                 if (currentUserData.lastDailyCheckIn === today) {
-                    alert("You have already checked in today!");
+                    alert("You have already checked in today! Come back tomorrow.");
                     return;
                 }
-                const rewardAmount = 50;
+
+                const rewardAmount = 50; // Define the reward amount
                 const newBalance = (currentUserData.balance || 0) + rewardAmount;
+
                 try {
                     await database.ref('users/' + currentUserData.uid).update({
                         balance: newBalance,
                         lastDailyCheckIn: today
                     });
-                    alert(`Daily Check-in! You received ${rewardAmount} coins.`);
+                    // Don't alert here, rely on the user data listener to update the UI
+                    // which provides a more consistent experience.
+                    // If an immediate visual confirmation beyond balance update is needed, use a showUIMessage.
+                    console.log(`Daily Check-in! User ${currentUserData.uid} received ${rewardAmount} coins.`);
                 } catch (error) {
                     console.error("Daily check-in error:", error);
-                    alert("Could not process check-in. Please try again.");
+                    alert("Could not process daily check-in. Please try again.");
                 }
             });
         }
 
         function updateSpinUI() {
             if (!currentUserData || !availableSpinsText || !spinButton) return;
-            availableSpinsText.textContent = `Available Spins: ${currentUserData.availableSpins || 0}`;
-            spinButton.disabled = (currentUserData.availableSpins || 0) <= 0 || isSpinning;
+            
+            const spins = currentUserData.availableSpins || 0;
+            availableSpinsText.textContent = `Available Spins: ${spins}`;
+            
+            const today = new Date().toISOString().split('T')[0];
+            const canSpinFreeToday = currentUserData.lastFreeSpinDate !== today;
+
+            // Enable spin button if user has purchased spins OR if they have a free spin available for today
+            spinButton.disabled = (spins <= 0 && !canSpinFreeToday) || isSpinning;
         }
 
         if (spinButton) {
             spinButton.addEventListener('click', async () => {
-                if (isSpinning || !currentUserData) return;
-                const today = new Date().toISOString().split('T')[0];
-                let canSpinFree = currentUserData.lastFreeSpinDate !== today;
-                let spinsToUse = currentUserData.availableSpins || 0;
+                if (isSpinning || !currentUserData || !currentUserData.uid) return;
 
-                if (spinsToUse <= 0 && !canSpinFree) {
-                     alert("No spins available. Deposit to get more or wait for your daily free spin tomorrow!");
+                const today = new Date().toISOString().split('T')[0];
+                let canUseFreeSpin = currentUserData.lastFreeSpinDate !== today;
+                let purchasedSpinsAvailable = (currentUserData.availableSpins || 0) > 0;
+
+                if (!canUseFreeSpin && !purchasedSpinsAvailable) {
+                     alert("No spins available. You've used your free spin for today. Deposit to get more spins or wait until tomorrow!");
+                     updateSpinUI(); // Refresh UI just in case
                      return;
                 }
                 
                 isSpinning = true;
-                spinResultText.textContent = "";
+                spinResultText.textContent = ""; // Clear previous result
                 spinButton.disabled = true;
-                spinButton.style.backgroundColor = '#ccc'; 
+                spinButton.style.backgroundColor = '#ccc'; // Visual feedback for disabled
 
-                let newAvailableSpins = spinsToUse;
-                let newLastFreeSpinDate = currentUserData.lastFreeSpinDate;
+                let spinTypeUsed = ""; // To track if free or purchased spin was used
+                let updates = {};
 
-                if (canSpinFree) { 
-                    newLastFreeSpinDate = today;
-                } else if (spinsToUse > 0) { 
-                    newAvailableSpins--;
-                } else { 
+                if (canUseFreeSpin) {
+                    updates.lastFreeSpinDate = today;
+                    spinTypeUsed = "free";
+                } else if (purchasedSpinsAvailable) {
+                    updates.availableSpins = currentUserData.availableSpins - 1;
+                    spinTypeUsed = "purchased";
+                } else {
+                    // This case should not be reached due to the check above, but as a safeguard:
                     isSpinning = false;
                     spinButton.disabled = false;
                     spinButton.style.backgroundColor = 'var(--primary-color)';
@@ -1635,81 +1709,90 @@
                     return;
                 }
 
-                const totalRotations = 3; 
+                // Spin animation logic
+                const totalRotations = 3; // For visual effect
                 const randomIndex = Math.floor(Math.random() * wheelSegments.length);
                 const segmentAngle = 360 / wheelSegments.length;
+                // Calculate angle to stop at the center of the chosen segment
                 const targetBaseAngle = (randomIndex * segmentAngle); 
-                const pointerStopAngle = targetBaseAngle + (segmentAngle / 2); 
-                const finalRotation = (totalRotations * 360) - pointerStopAngle + (segmentAngle * 0.05); 
+                const pointerStopAngle = targetBaseAngle + (segmentAngle / 2); // Middle of the segment
+                // Final rotation angle: full rotations - angle to align pointer correctly
+                const finalRotation = (totalRotations * 360) - pointerStopAngle + (segmentAngle * 0.05); // Small offset for better visual alignment
 
                 spinWheel.style.transform = `rotate(${finalRotation}deg)`;
 
+                // After animation completes
                 setTimeout(async () => {
                     isSpinning = false;
-                    spinButton.style.backgroundColor = 'var(--primary-color)';
+                    spinButton.style.backgroundColor = 'var(--primary-color)'; // Reset button color
+
                     const winningSegment = wheelSegments[randomIndex];
-                    spinResultText.textContent = `You won: ${winningSegment.label}! ${winningSegment.value > 0 ? `(+${winningSegment.value} coins)` : '(No coins)'}`;
+                    spinResultText.textContent = `You won: ${winningSegment.label}! ${winningSegment.value > 0 ? `(+${winningSegment.value} coins)` : '(No coins this time)'}`;
                     
-                    let updates = {
-                        availableSpins: newAvailableSpins,
-                        lastFreeSpinDate: newLastFreeSpinDate
-                    };
                     if (winningSegment.value > 0) {
                         updates.balance = (currentUserData.balance || 0) + winningSegment.value;
                     }
 
                     try {
                         await database.ref('users/' + currentUserData.uid).update(updates);
+                        console.log(`Spin result for ${currentUserData.uid}: Won ${winningSegment.value} from a ${spinTypeUsed} spin. Updates:`, updates);
+                        // UI will update via the main user data listener. updateSpinUI() will also be called by it.
                     } catch (error) {
-                        console.error("Spin update error:", error);
-                        alert("Error saving spin result. Please check your connection.");
-                        // updateSpinUI will be triggered by the user data listener
+                        console.error("Error updating user data after spin:", error);
+                        alert("Error saving spin result. Your balance might not be updated. Please check your connection.");
+                        // Revert local state if DB update fails and then rely on listener to fetch true state
+                        // This is complex, simpler to just let the listener correct it.
                     }
-                }, 4100); 
+                    // updateSpinUI(); // Called by the listener eventually, but can call here for faster perceived update
+                }, 4100); // Match CSS transition duration + a small buffer
             });
         }
 
         if (copyReferralCodeButton) {
             copyReferralCodeButton.addEventListener('click', () => {
                 const codeToCopy = referralCodeDisplay.textContent;
-                if (codeToCopy === "LOGIN" || codeToCopy === "N/A") {
-                    alert("Login to get your referral code.");
+                if (!currentUserData || codeToCopy === "LOGIN" || codeToCopy === "N/A") {
+                    alert("Please login to get your referral code.");
                     return;
                 }
                 navigator.clipboard.writeText(codeToCopy).then(() => {
-                    alert('Referral code copied!');
+                    alert('Referral code copied to clipboard!');
                 }).catch(err => {
-                    console.error('Failed to copy: ', err);
-                    alert('Failed to copy code.');
+                    console.error('Failed to copy referral code: ', err);
+                    alert('Failed to copy code. You may need to copy it manually.');
                 });
             });
         }
         
         if (updateNameButton) {
             updateNameButton.addEventListener('click', async () => {
-                if (!currentUserData) return;
+                if (!currentUserData || !currentUserData.uid) return;
                 const newName = profileEditNameInput.value.trim();
                 if (!newName) {
                     showUIMessage(profileMessage, "Name cannot be empty.", "error");
                     return;
                 }
                 if (newName === currentUserData.username) {
-                    showUIMessage(profileMessage, "Name is already set to this.", "success");
+                    showUIMessage(profileMessage, "Name is already set to this. No changes made.", "success"); // Use "success" for no-op
                     return;
                 }
                 try {
+                    updateNameButton.disabled = true;
                     await database.ref('users/' + currentUserData.uid).update({ username: newName });
                     showUIMessage(profileMessage, "Name updated successfully!", "success");
+                    // currentUserData.username will be updated by the listener
                 } catch (error) {
                     console.error("Update name error:", error);
-                    showUIMessage(profileMessage, "Error updating name.", "error");
+                    showUIMessage(profileMessage, "Error updating name. Please try again.", "error");
+                } finally {
+                    updateNameButton.disabled = false;
                 }
             });
         }
 
         if (updateEmailButton) {
             updateEmailButton.addEventListener('click', async () => {
-                if (!currentUserData) return;
+                if (!currentUserData || !currentUserData.uid) return;
                 const newEmail = profileEditEmailInput.value.trim();
                 const currentPassword = profileCurrentPasswordForEmailInput.value;
 
@@ -1717,31 +1800,50 @@
                     showUIMessage(profileMessage, "New email and current password are required.", "error");
                     return;
                 }
+                 // Basic email format validation
+                if (!/^\S+@\S+\.\S+$/.test(newEmail)) {
+                    showUIMessage(profileMessage, "Please enter a valid email address.", "error");
+                    return;
+                }
                 if (newEmail === currentUserData.email) {
-                     showUIMessage(profileMessage, "This is already your current email.", "success");
+                     showUIMessage(profileMessage, "This is already your current email. No changes made.", "success");
                     return;
                 }
 
                 const user = auth.currentUser;
-                if (!user) return;
+                if (!user) { // Should not happen if currentUserData is set, but good check
+                    showUIMessage(profileMessage, "User not authenticated. Please re-login.", "error");
+                    return;
+                }
 
                 const credential = firebase.auth.EmailAuthProvider.credential(user.email, currentPassword);
                 try {
-                    await user.reauthenticateWithCredential(credential);
-                    await user.updateEmail(newEmail);
-                    await database.ref('users/' + user.uid).update({ email: newEmail });
-                    profileCurrentPasswordForEmailInput.value = ''; 
-                    showUIMessage(profileMessage, "Email updated successfully! You might need to re-login elsewhere.", "success");
+                    updateEmailButton.disabled = true;
+                    await user.reauthenticateWithCredential(credential); // Verify current password
+                    await user.updateEmail(newEmail); // Update email in Firebase Auth
+                    await database.ref('users/' + user.uid).update({ email: newEmail }); // Update email in Realtime Database
+
+                    profileCurrentPasswordForEmailInput.value = ''; // Clear password field
+                    showUIMessage(profileMessage, "Email updated successfully! You might need to re-login on other devices.", "success");
+                    // currentUserData.email will be updated by the listener
                 } catch (error) {
                     console.error("Update email error:", error);
-                    showUIMessage(profileMessage, `Error updating email: ${error.message}`, "error");
+                    let errorMessage = "Error updating email. Please try again.";
+                    if (error.code === 'auth/wrong-password') {
+                        errorMessage = "Incorrect current password. Please try again.";
+                    } else if (error.code === 'auth/email-already-in-use') {
+                        errorMessage = "This email address is already in use by another account.";
+                    }
+                    showUIMessage(profileMessage, errorMessage, "error");
+                } finally {
+                    updateEmailButton.disabled = false;
                 }
             });
         }
 
         if (updatePasswordButton) {
             updatePasswordButton.addEventListener('click', async () => {
-                if (!currentUserData) return;
+                if (!currentUserData || !currentUserData.uid) return;
                 const currentPassword = profileCurrentPasswordForPasswordInput.value;
                 const newPassword = profileNewPasswordInput.value;
                 const confirmNewPassword = profileConfirmNewPasswordInput.value;
@@ -1751,7 +1853,7 @@
                     return;
                 }
                 if (newPassword.length < 6) {
-                    showUIMessage(profileMessage, "New password must be at least 6 characters.", "error");
+                    showUIMessage(profileMessage, "New password must be at least 6 characters long.", "error");
                     return;
                 }
                 if (newPassword !== confirmNewPassword) {
@@ -1760,98 +1862,136 @@
                 }
 
                 const user = auth.currentUser;
-                if (!user) return;
+                if (!user) {
+                    showUIMessage(profileMessage, "User not authenticated. Please re-login.", "error");
+                    return;
+                }
 
                 const credential = firebase.auth.EmailAuthProvider.credential(user.email, currentPassword);
                 try {
-                    await user.reauthenticateWithCredential(credential);
-                    await user.updatePassword(newPassword);
+                    updatePasswordButton.disabled = true;
+                    await user.reauthenticateWithCredential(credential); // Verify current password
+                    await user.updatePassword(newPassword); // Update password in Firebase Auth
+
+                    // Clear all password fields after successful update
                     profileCurrentPasswordForPasswordInput.value = '';
                     profileNewPasswordInput.value = '';
                     profileConfirmNewPasswordInput.value = '';
                     showUIMessage(profileMessage, "Password updated successfully!", "success");
-                } catch (error)
-                {
+                } catch (error) {
                     console.error("Update password error:", error);
-                    showUIMessage(profileMessage, `Error updating password: ${error.message}`, "error");
+                    let errorMessage = "Error updating password. Please try again.";
+                    if (error.code === 'auth/wrong-password') {
+                        errorMessage = "Incorrect current password. Please try again.";
+                    }
+                    showUIMessage(profileMessage, errorMessage, "error");
+                } finally {
+                    updatePasswordButton.disabled = false;
                 }
             });
         }
 
         if (submitDepositButton) {
             submitDepositButton.addEventListener('click', async () => {
-                if (!currentUserData) return;
+                if (!currentUserData || !currentUserData.uid) {
+                    showUIMessage(depositMessage, "Please login to submit a deposit request.", "error");
+                    return;
+                }
                 const amount = parseFloat(depositAmountInput.value);
                 const tid = depositTidInput.value.trim();
 
-                if (isNaN(amount) || amount <= 0 || !tid) {
-                    showUIMessage(depositMessage, "Please enter a valid amount and TID.", "error");
+                if (isNaN(amount) || amount <= 0) {
+                    showUIMessage(depositMessage, "Please enter a valid positive amount.", "error");
                     return;
                 }
+                if (!tid) {
+                    showUIMessage(depositMessage, "Please enter the Transaction ID (TID).", "error");
+                    return;
+                }
+
                 const depositData = {
                     userId: currentUserData.uid,
                     username: currentUserData.username, 
+                    email: currentUserData.email, // Good to log email for admin reference
                     amount: amount,
                     tid: tid,
-                    timestamp: serverTimestamp,
-                    status: "pending" 
+                    timestamp: serverTimestamp, // Firebase server-side timestamp
+                    status: "pending" // Initial status
                 };
-                try {
-                    const newDepositRef = database.ref('depositRequests/' + currentUserData.uid).push();
-                    await newDepositRef.set(depositData);
-                    await database.ref('allDepositRequests').child(newDepositRef.key).set({
-                        ...depositData, 
-                        userSpecificPath: `depositRequests/${currentUserData.uid}/${newDepositRef.key}` 
-                    });
 
-                    alert("Your deposit request has been submitted and is under review. Bonus spins, if applicable, will be awarded upon approval.");
+                try {
+                    submitDepositButton.disabled = true;
+                    submitDepositButton.textContent = "Submitting...";
+
+                    // Push to user-specific deposit requests
+                    const newDepositRefUser = database.ref('depositRequests/' + currentUserData.uid).push();
+                    // Push to a general pool for admin review, including path to user-specific one
+                    const newDepositRefAdmin = database.ref('allDepositRequests').child(newDepositRefUser.key); // Use same key
+
+                    const updates = {};
+                    updates[`depositRequests/${currentUserData.uid}/${newDepositRefUser.key}`] = depositData;
+                    updates[`allDepositRequests/${newDepositRefUser.key}`] = {
+                        ...depositData, 
+                        userSpecificPath: `depositRequests/${currentUserData.uid}/${newDepositRefUser.key}` 
+                    };
                     
-                    showUIMessage(depositMessage, "Deposit request submitted! It will be reviewed.", "success");
-                    depositAmountInput.value = '';
+                    await database.ref().update(updates);
+
+                    showUIMessage(depositMessage, "Deposit request submitted successfully! It is now under review. Bonus spins, if applicable, will be awarded upon approval.", "success");
+                    depositAmountInput.value = ''; // Clear input fields
                     depositTidInput.value = '';
                 } catch (error) {
                     console.error("Deposit submission error:", error);
-                    showUIMessage(depositMessage, "Error submitting deposit request.", "error");
+                    showUIMessage(depositMessage, "Error submitting deposit request. Please try again.", "error");
+                } finally {
+                    submitDepositButton.disabled = false;
+                    submitDepositButton.textContent = "Submit Deposit Request";
                 }
             });
         }
 
         if (submitWithdrawalButton) {
             submitWithdrawalButton.addEventListener('click', async () => {
-                if (!currentUserData) {
-                     showUIMessage(withdrawalMessage, "Please login to make a withdrawal.", "error");
+                if (!currentUserData || !currentUserData.uid) {
+                     showUIMessage(withdrawalMessage, "Please login to make a withdrawal request.", "error");
                      return;
                 }
                 const method = withdrawMethodSelect.value;
                 const accountName = withdrawAccountNameInput.value.trim();
                 const accountNumber = withdrawAccountNumberInput.value.trim();
-                const amount = parseInt(withdrawAmountInput.value);
+                const amount = parseInt(withdrawAmountInput.value); // Coins are usually whole numbers
 
-                if (!accountName || !accountNumber || isNaN(amount) || amount <= 0) {
-                    showUIMessage(withdrawalMessage, "Please fill all fields with valid data.", "error");
+                if (!accountName || !accountNumber) {
+                    showUIMessage(withdrawalMessage, "Please fill in account name and number.", "error");
                     return;
                 }
-                if (amount < 1000) { 
+                 if (isNaN(amount) || amount <= 0) {
+                    showUIMessage(withdrawalMessage, "Please enter a valid positive amount to withdraw.", "error");
+                    return;
+                }
+                if (amount < 1000) { // Example minimum withdrawal
                     showUIMessage(withdrawalMessage, "Minimum withdrawal amount is 1000 coins.", "error");
                     return;
                 }
                 if (amount > currentUserData.balance) {
-                    showUIMessage(withdrawalMessage, "Insufficient balance for this withdrawal.", "error");
+                    showUIMessage(withdrawalMessage, "Insufficient balance for this withdrawal amount.", "error");
                     return;
                 }
 
-                const newBalance = currentUserData.balance - amount; // Balance after deduction
+                // IMPORTANT: Deduct balance immediately upon submission
+                const newBalance = currentUserData.balance - amount; 
 
                 const withdrawalData = {
                     userId: currentUserData.uid,
-                    username: currentUserData.username, 
+                    username: currentUserData.username,
+                    email: currentUserData.email, // For admin reference
                     method: method,
                     accountName: accountName,
                     accountNumber: accountNumber,
-                    amount: amount, // Store the actual amount of the withdrawal
+                    amount: amount, 
                     timestamp: serverTimestamp,
-                    status: "pending",
-                    reversalProcessed: false // Initialize this field
+                    status: "pending", // Initial status
+                    reversalProcessed: false // Important for refund logic
                 };
                 
                 try {
@@ -1859,10 +1999,11 @@
                     submitWithdrawalButton.textContent = "Processing...";
 
                     const newWithdrawalKey = database.ref('withdrawalRequests/' + currentUserData.uid).push().key;
-                    if (!newWithdrawalKey) throw new Error("Failed to generate withdrawal key.");
+                    if (!newWithdrawalKey) throw new Error("Failed to generate a unique key for withdrawal request.");
                     
+                    // Atomically update user's balance and create withdrawal requests
                     const updates = {};
-                    updates[`users/${currentUserData.uid}/balance`] = newBalance; // Update user's balance
+                    updates[`users/${currentUserData.uid}/balance`] = newBalance; 
                     updates[`withdrawalRequests/${currentUserData.uid}/${newWithdrawalKey}`] = withdrawalData;
                     updates[`allWithdrawalRequests/${newWithdrawalKey}`] = { // For admin view
                         ...withdrawalData,
@@ -1871,18 +2012,16 @@
 
                     await database.ref().update(updates);
 
-                    // Optimistic UI update for balance
-                    // currentUserData.balance = newBalance; // This will be updated by the listener
-                    // updateUserInfoUI(currentUserData);     // This will be updated by the listener
-
-                    showUIMessage(withdrawalMessage, "Withdrawal request submitted! Coins deducted. It will be processed.", "success");
+                    // UI will update balance via the main user data listener.
+                    showUIMessage(withdrawalMessage, "Withdrawal request submitted! Your coins have been deducted and the request is under review.", "success");
+                    // Clear input fields
                     withdrawAccountNameInput.value = '';
                     withdrawAccountNumberInput.value = '';
                     withdrawAmountInput.value = '';
                 } catch (error) {
                     console.error("Withdrawal submission error:", error);
-                    showUIMessage(withdrawalMessage, "Error submitting withdrawal request. Please try again.", "error");
-                    // Note: If DB update fails, balance is not changed. The user listener will eventually reflect the correct DB state.
+                    showUIMessage(withdrawalMessage, "Error submitting withdrawal request. Your balance has not been changed. Please try again.", "error");
+                    // Note: If the atomic update fails, user's balance in DB remains unchanged.
                 } finally {
                     submitWithdrawalButton.disabled = false;
                     submitWithdrawalButton.textContent = "Submit Withdrawal Request";
@@ -1891,15 +2030,15 @@
         }
 
         async function loadDepositHistory() {
-            if (!currentUserData || !depositHistoryList) {
-                if (depositHistoryList) depositHistoryList.innerHTML = "<p>Please login to see history.</p>";
+            if (!currentUserData || !currentUserData.uid || !depositHistoryList) {
+                if (depositHistoryList) depositHistoryList.innerHTML = "<p style='text-align:center;'>Please login to view deposit history.</p>";
                 return;
             }
-            depositHistoryList.innerHTML = "<p style='text-align:center;'>Loading history...</p>";
+            depositHistoryList.innerHTML = "<p style='text-align:center;'>Loading deposit history...</p>";
             try {
                 const snapshot = await database.ref('depositRequests/' + currentUserData.uid)
-                                           .orderByChild('timestamp')
-                                           .limitToLast(20) 
+                                           .orderByChild('timestamp') // Order by time
+                                           .limitToLast(20) // Get the last 20 requests
                                            .once('value');
                 if (snapshot.exists()) {
                     let html = '';
@@ -1907,13 +2046,14 @@
                     snapshot.forEach(childSnapshot => { 
                         requests.push({ id: childSnapshot.key, ...childSnapshot.val() });
                     });
-                    requests.reverse().forEach(req => { 
+                    requests.reverse().forEach(req => { // Display newest first
                         html += `
                             <div class="transaction-list-item">
                                 <p><strong>Amount:</strong> ${req.amount} PKR</p>
-                                <p><strong>TID:</strong> ${req.tid}</p>
-                                <p><strong>Date:</strong> ${new Date(req.timestamp).toLocaleDateString()}</p>
+                                <p><strong>TID:</strong> ${req.tid || 'N/A'}</p>
+                                <p><strong>Date:</strong> ${new Date(req.timestamp).toLocaleDateString()} ${new Date(req.timestamp).toLocaleTimeString()}</p>
                                 <p><strong>Status:</strong> <span class="status ${req.status ? req.status.toLowerCase() : 'pending'}">${req.status || 'pending'}</span></p>
+                                ${req.adminNotes ? `<p style="font-size:0.85em; color:var(--text-light);">Note: ${req.adminNotes}</p>` : ''}
                             </div>
                         `;
                     });
@@ -1923,20 +2063,20 @@
                 }
             } catch (error) {
                 console.error("Error loading deposit history:", error);
-                depositHistoryList.innerHTML = "<p style='text-align:center;'>Error loading history.</p>";
+                depositHistoryList.innerHTML = "<p style='text-align:center;'>Error loading deposit history. Please try again.</p>";
             }
         }
         
         async function loadWithdrawalHistory() {
-            if (!currentUserData || !withdrawalHistoryList) {
-                if (withdrawalHistoryList) withdrawalHistoryList.innerHTML = "<p>Please login to see history.</p>";
+            if (!currentUserData || !currentUserData.uid || !withdrawalHistoryList) {
+                if (withdrawalHistoryList) withdrawalHistoryList.innerHTML = "<p style='text-align:center;'>Please login to view withdrawal history.</p>";
                 return;
             }
-            withdrawalHistoryList.innerHTML = "<p style='text-align:center;'>Loading history...</p>";
+            withdrawalHistoryList.innerHTML = "<p style='text-align:center;'>Loading withdrawal history...</p>";
             try {
                 const snapshot = await database.ref('withdrawalRequests/' + currentUserData.uid)
                                            .orderByChild('timestamp')
-                                           .limitToLast(20)
+                                           .limitToLast(20) // Get the last 20 requests
                                            .once('value');
                 if (snapshot.exists()) {
                     let html = '';
@@ -1944,19 +2084,24 @@
                     snapshot.forEach(childSnapshot => {
                          requests.push({ id: childSnapshot.key, ...childSnapshot.val() });
                     });
-                    requests.reverse().forEach(req => {
+                    requests.reverse().forEach(req => { // Display newest first
                         let statusText = req.status || 'pending';
+                        let statusClass = statusText.toLowerCase();
+
+                        // Append refund information if applicable
                         if (req.status === 'rejected' && req.reversalProcessed) {
                             statusText += ' (Refunded)';
                         }
+                        
                         html += `
                             <div class="transaction-list-item">
                                 <p><strong>Amount:</strong> 🪙 ${req.amount.toLocaleString()}</p>
                                 <p><strong>Method:</strong> ${req.method}</p>
                                 <p><strong>Account:</strong> ${req.accountName} (${req.accountNumber})</p>
-                                <p><strong>Date:</strong> ${new Date(req.timestamp).toLocaleDateString()}</p>
-                                <p><strong>Status:</strong> <span class="status ${req.status ? req.status.toLowerCase() : 'pending'}">${statusText}</span></p>
-                                ${req.statusMessage ? `<p style="font-size:0.8em; color:var(--text-light);">${req.statusMessage}</p>` : ''}
+                                <p><strong>Date:</strong> ${new Date(req.timestamp).toLocaleDateString()} ${new Date(req.timestamp).toLocaleTimeString()}</p>
+                                <p><strong>Status:</strong> <span class="status ${statusClass}">${statusText}</span></p>
+                                ${req.statusMessage ? `<p style="font-size:0.85em; color:var(--text-light);">${req.statusMessage}</p>` : ''}
+                                ${req.adminNotes ? `<p style="font-size:0.85em; color:var(--text-light);">Note: ${req.adminNotes}</p>` : ''}
                             </div>
                         `;
                     });
@@ -1966,7 +2111,7 @@
                 }
             } catch (error) {
                 console.error("Error loading withdrawal history:", error);
-                withdrawalHistoryList.innerHTML = "<p style='text-align:center;'>Error loading history.</p>";
+                withdrawalHistoryList.innerHTML = "<p style='text-align:center;'>Error loading withdrawal history. Please try again.</p>";
             }
         }
 
@@ -1976,8 +2121,8 @@
 
             try {
                 const updatesSnapshot = await database.ref('updates')
-                                                  .orderByChild('timestamp') 
-                                                  .limitToLast(20) 
+                                                  .orderByChild('timestamp') // Order by timestamp
+                                                  .limitToLast(20) // Get latest 20 updates
                                                   .once('value');
                 if (!updatesSnapshot.exists()) {
                     updateListContainer.innerHTML = "<p style='text-align:center;'>No updates available at the moment.</p>";
@@ -1988,51 +2133,56 @@
                 updatesSnapshot.forEach(childSnapshot => {
                     updates.push({ id: childSnapshot.key, ...childSnapshot.val() });
                 });
-                updates.sort((a, b) => b.timestamp - a.timestamp); 
+                updates.sort((a, b) => b.timestamp - a.timestamp); // Ensure newest are first (client-side sort after fetch)
 
                 let updatesHtml = '';
                 updates.forEach(update => {
                     updatesHtml += `
                         <div class="update-item">
                             <div class="update-header">
-                                <span class="update-title">${update.title || 'Update'}</span>
+                                <span class="update-title">${update.title || 'Important Update'}</span>
                                 <span class="update-date">${new Date(update.timestamp).toLocaleDateString()}</span>
                             </div>
-                            <p class="update-description">${(update.description || '').replace(/\n/g, '<br>')}</p>
-                            ${update.version ? `<span class="update-version">Version: ${update.version}</span>` : ''}
+                            <p class="update-description">${(update.description || 'No further details.').replace(/\n/g, '<br>')}</p>
+                            ${update.version ? `<span class="update-version">App Version: ${update.version}</span>` : ''}
                         </div>
                     `;
                 });
-                updateListContainer.innerHTML = updatesHtml || "<p style='text-align:center;'>No updates found.</p>";
+                updateListContainer.innerHTML = updatesHtml || "<p style='text-align:center;'>No updates found after processing.</p>";
 
             } catch (error) {
                 console.error("Error loading updates:", error);
-                updateListContainer.innerHTML = "<p style='text-align:center;'>Error loading updates. Please try again later.</p>";
+                updateListContainer.innerHTML = "<p style='text-align:center;'>Failed to load updates. Please check your connection and try again.</p>";
             }
         }
 
         function initChat() {
-            if (!currentUserData) {
-                chatMessagesContainer.innerHTML = "<p style='text-align:center; color: var(--text-light);'>Please login to use chat.</p>";
+            if (!currentUserData || !currentUserData.uid) {
+                chatMessagesContainer.innerHTML = "<p style='text-align:center; color: var(--text-light);'>Please login to use the live chat.</p>";
                 if(chatMessageInput) chatMessageInput.disabled = true;
                 if(sendChatMessageButton) sendChatMessageButton.disabled = true;
                 return;
             }
+            // Enable chat input if user is logged in
             if(chatMessageInput) chatMessageInput.disabled = false;
             if(sendChatMessageButton) sendChatMessageButton.disabled = false;
 
+            // Show loading message only if no messages are currently displayed and listener isn't attached
             const placeholder = chatMessagesContainer.querySelector('p[style*="text-align:center"]');
-             if (!chatListenerAttached || (placeholder && chatMessagesContainer.children.length === 1)) { 
+             if (!chatListenerAttached || (placeholder && chatMessagesContainer.children.length === 1 && placeholder.textContent.includes("Loading chat"))) { 
                  chatMessagesContainer.innerHTML = '<p style="text-align:center; color: var(--text-light);">Loading messages...</p>';
              }
             
             chatMessagesRef = database.ref('liveChatMessages');
 
-            if (!chatListenerAttached) {
-                chatMessagesContainer.innerHTML = ''; 
+            if (!chatListenerAttached) { // Attach listener only once
+                chatMessagesContainer.innerHTML = ''; // Clear previous messages or loading text before adding new ones
+                
+                // Listen for new messages being added
                 chatMessagesRef.orderByChild('timestamp').limitToLast(50).on('child_added', (snapshot) => {
                     const messageData = snapshot.val();
                     if (messageData) {
+                        // Remove "Loading messages..." or "No messages yet..." placeholder if it exists
                         const loadingPlaceholder = chatMessagesContainer.querySelector('p[style*="text-align:center"]');
                         if (loadingPlaceholder) { 
                            loadingPlaceholder.remove();
@@ -2041,13 +2191,15 @@
                     }
                 }, (error) => {
                     console.error("Error attaching chat listener: ", error);
-                    chatMessagesContainer.innerHTML = "<p style='text-align:center; color:red;'>Error loading chat.</p>";
+                    chatMessagesContainer.innerHTML = "<p style='text-align:center; color:red;'>Error loading chat messages. Please try refreshing.</p>";
+                    chatListenerAttached = false; // Allow re-attachment on next screen visit
                 });
-                chatListenerAttached = true;
+                chatListenerAttached = true; // Mark listener as attached
                 
+                // Check if there are any messages initially after attaching listener
                 chatMessagesRef.orderByChild('timestamp').limitToLast(1).once('value', snapshot => {
                     if (!snapshot.exists() && chatMessagesContainer.children.length === 0) { 
-                         chatMessagesContainer.innerHTML = "<p style='text-align:center; color: var(--text-light);'>No messages yet. Be the first!</p>";
+                         chatMessagesContainer.innerHTML = "<p style='text-align:center; color: var(--text-light);'>No messages yet. Be the first to say hello!</p>";
                     }
                 });
             }
@@ -2055,34 +2207,38 @@
 
         function detachChatListener() {
             if (chatMessagesRef && chatListenerAttached) {
-                chatMessagesRef.off(); 
+                chatMessagesRef.off(); // Detach all listeners on this reference
                 chatListenerAttached = false;
-                console.log("Chat listener detached.");
+                chatMessagesRef = null; // Clear the reference
+                console.log("Live chat listener detached.");
             }
         }
 
         function displayChatMessage(message) {
-            if (!chatMessagesContainer || !currentUserData) return;
+            if (!chatMessagesContainer || !currentUserData || !currentUserData.uid) return;
 
             const messageElement = document.createElement('div');
             messageElement.classList.add('chat-message');
 
             const textElement = document.createElement('p');
             textElement.classList.add('message-text-content');
+            // Sanitize text content if it's directly from user input without server-side sanitization
+            // For this example, assuming text is safe or will be handled.
             textElement.textContent = message.text; 
             
             const timeElement = document.createElement('span');
             timeElement.classList.add('message-time');
-            timeElement.textContent = message.timestamp ? new Date(message.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '';
+            timeElement.textContent = message.timestamp ? new Date(message.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : 'Sending...';
 
 
             if (message.userId === currentUserData.uid) {
                 messageElement.classList.add('my-message');
             } else {
                 messageElement.classList.add('other-message');
+                // Add sender's name for messages from others
                 const senderNameElement = document.createElement('span');
                 senderNameElement.classList.add('sender-name');
-                senderNameElement.textContent = message.username || "Anonymous";
+                senderNameElement.textContent = message.username || "Anonymous User"; // Fallback username
                 messageElement.appendChild(senderNameElement); 
             }
             
@@ -2090,6 +2246,7 @@
             messageElement.appendChild(timeElement);
             
             chatMessagesContainer.appendChild(messageElement);
+            // Auto-scroll to the latest message
             chatMessagesContainer.scrollTop = chatMessagesContainer.scrollHeight;
         }
 
@@ -2098,34 +2255,37 @@
         }
         if (chatMessageInput) {
             chatMessageInput.addEventListener('keypress', (e) => {
-                if (e.key === 'Enter' && !e.shiftKey) { 
-                    e.preventDefault(); 
+                if (e.key === 'Enter' && !e.shiftKey) { // Send on Enter, allow Shift+Enter for newline
+                    e.preventDefault(); // Prevent default Enter behavior (like form submission)
                     sendChatMessage();
                 }
             });
         }
 
         async function sendChatMessage() {
-            if (!currentUserData || !chatMessageInput || !chatMessagesRef) {
+            if (!currentUserData || !currentUserData.uid || !chatMessageInput || !chatMessagesRef) {
                 alert("You must be logged in to send messages.");
                 return;
             }
             const messageText = chatMessageInput.value.trim();
-            if (messageText === "") return;
+            if (messageText === "") return; // Don't send empty messages
 
             const messageData = {
                 userId: currentUserData.uid,
                 username: currentUserData.username,
                 text: messageText,
-                timestamp: serverTimestamp 
+                timestamp: serverTimestamp // Use Firebase server timestamp for consistency
             };
 
             try {
+                sendChatMessageButton.disabled = true; // Prevent double sending
                 await chatMessagesRef.push(messageData);
-                chatMessageInput.value = ""; 
+                chatMessageInput.value = ""; // Clear input field after sending
             } catch (error) {
                 console.error("Error sending chat message:", error);
-                alert("Could not send message. Please try again.");
+                alert("Could not send message. Please check your connection and try again.");
+            } finally {
+                if(sendChatMessageButton) sendChatMessageButton.disabled = false;
             }
         }
 
@@ -2134,16 +2294,17 @@
             if (segmentTextSpans.length === wheelSegments.length) {
                 segmentTextSpans.forEach((span, index) => {
                     const segmentData = wheelSegments[index];
-                    span.textContent = segmentData.label; 
+                    span.textContent = segmentData.label; // Use emoji or text label
                 });
             } else {
-                console.warn("Mismatch between number of wheel segment text elements and wheelSegments array. Expected " + wheelSegments.length + ", found " + segmentTextSpans.length);
+                console.warn("Spin wheel UI mismatch: Expected " + wheelSegments.length + " segments, found " + segmentTextSpans.length + " display elements.");
             }
         }
 
+        // Initialize on DOMContentLoaded
         document.addEventListener('DOMContentLoaded', () => {
             populateSpinWheelSegments(); 
-             // Initially hide bottom nav until login
+            // Initially hide bottom nav; onAuthStateChanged will show it after login
             if (bottomNav) bottomNav.style.display = 'none';
         });
 
